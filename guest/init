@@ -5,5 +5,9 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 echo 'EDU_LAB_BOOT_OK'
 busybox uname -r
-/edu-client
+insmod /edu_lab.ko || poweroff -f
+/edu-client || echo EDU_LAB_FAIL
+rmmod edu_lab || echo EDU_LAB_FAIL
+dmesg | grep edu_lab
+echo EDU_LAB_SLICE_DONE
 poweroff -f

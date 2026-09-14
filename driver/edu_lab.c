@@ -1,8 +1,223 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/module.h>
-static int __init edu_lab_init(void) { return 0; }
-static void __exit edu_lab_exit(void) { }
-module_init(edu_lab_init);
-module_exit(edu_lab_exit);
+#include <linux/pci.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
+#include <linux/kref.h>
+#include <linux/iopoll.h>
+#include <linux/dma-mapping.h>
+#include "edu_lab.h"
+
+#define REG_ID 0x00
+#define REG_LIVE 0x04
+#define REG_FACT 0x08
+#define REG_STATUS 0x20
+#define STATUS_BUSY 0x01
+#define LAB_TIMEOUT_MS 1000U
+
+struct lab_device {
+    struct pci_dev *pdev;
+    void __iomem *bar;
+    struct miscdevice misc;
+    struct mutex op_mutex;
+    struct kref ref;
+    enum edu_lab_state state;
+    u64 computations;
+    u64 timeouts;
+};
+
+static void lab_release_ref(struct kref *ref)
+{
+    kfree(container_of(ref, struct lab_device, ref));
+}
+
+static int lab_open(struct inode *inode, struct file *file)
+{
+    struct miscdevice *misc = file->private_data;
+    struct lab_device *lab = container_of(misc, struct lab_device, misc);
+
+    kref_get(&lab->ref);
+    file->private_data = lab;
+    return nonseekable_open(inode, file);
+}
+
+static int lab_release(struct inode *inode, struct file *file)
+{
+    struct lab_device *lab = file->private_data;
+
+    kref_put(&lab->ref, lab_release_ref);
+    return 0;
+}
+
+static int validate_header(const struct edu_lab_header *h, u32 size)
+{
+    if (h->version != EDU_LAB_ABI_VERSION || h->size != size ||
+        h->flags || h->reserved)
+        return -EINVAL;
+    return 0;
+}
+
+static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct lab_device *lab = file->private_data;
+    void __user *user = (void __user *)arg;
+    struct edu_lab_header header;
+    struct edu_lab_compute compute;
+    struct edu_lab_caps caps;
+    u32 status;
+    int ret;
+
+    if (cmd != EDU_LAB_GET_CAPS && cmd != EDU_LAB_COMPUTE)
+        return -ENOTTY;
+    if (copy_from_user(&header, user, sizeof(header)))
+        return -EFAULT;
+    ret = validate_header(&header, _IOC_SIZE(cmd));
+    if (ret)
+        return ret;
+    if (mutex_lock_interruptible(&lab->op_mutex))
+        return -ERESTARTSYS;
+    if (lab->state == EDU_LAB_REMOVED) {
+        ret = -ENODEV;
+        goto out;
+    }
+    if (cmd == EDU_LAB_GET_CAPS) {
+        memset(&caps, 0, sizeof(caps));
+        caps.header = header;
+        caps.device_id = readl(lab->bar + REG_ID);
+        caps.max_factorial = EDU_LAB_MAX_FACTORIAL;
+        caps.timeout_ms = LAB_TIMEOUT_MS;
+        caps.state = lab->state;
+        caps.features = EDU_LAB_FEATURE_COMPUTE;
+        caps.computations = lab->computations;
+        caps.timeouts = lab->timeouts;
+        ret = copy_to_user(user, &caps, sizeof(caps)) ? -EFAULT : 0;
+        goto out;
+    }
+    if (copy_from_user(&compute, user, sizeof(compute))) {
+        ret = -EFAULT;
+        goto out;
+    }
+    ret = validate_header(&compute.header, sizeof(compute));
+    if (ret || compute.reserved[0] || compute.reserved[1] ||
+        compute.input > EDU_LAB_MAX_FACTORIAL) {
+        ret = -EINVAL;
+        goto out;
+    }
+    if (lab->state == EDU_LAB_FAILED) {
+        ret = -EIO;
+        goto out;
+    }
+    lab->state = EDU_LAB_COMPUTE;
+    writel(compute.input, lab->bar + REG_FACT);
+    ret = readl_poll_timeout(lab->bar + REG_STATUS, status,
+                            !(status & STATUS_BUSY), 100, LAB_TIMEOUT_MS * 1000);
+    if (ret) {
+        lab->state = EDU_LAB_FAILED;
+        lab->timeouts++;
+        goto out;
+    }
+    compute.result = readl(lab->bar + REG_FACT);
+    lab->state = EDU_LAB_IDLE;
+    lab->computations++;
+    ret = copy_to_user(user, &compute, sizeof(compute)) ? -EFAULT : 0;
+out:
+    mutex_unlock(&lab->op_mutex);
+    return ret;
+}
+
+static const struct file_operations lab_fops = {
+    .owner = THIS_MODULE,
+    .open = lab_open,
+    .release = lab_release,
+    .unlocked_ioctl = lab_ioctl,
+    .llseek = no_llseek,
+};
+
+static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+    struct lab_device *lab;
+    int ret;
+
+    lab = kzalloc(sizeof(*lab), GFP_KERNEL);
+    if (!lab)
+        return -ENOMEM;
+    kref_init(&lab->ref);
+    mutex_init(&lab->op_mutex);
+    lab->pdev = pdev;
+    ret = pci_enable_device_mem(pdev);
+    if (ret)
+        goto free_lab;
+    if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM) ||
+        pci_resource_len(pdev, 0) < SZ_1M) {
+        ret = -ENODEV;
+        goto disable;
+    }
+    ret = pci_request_region(pdev, 0, "edu_lab");
+    if (ret)
+        goto disable;
+    ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(28));
+    if (ret)
+        goto release_region;
+    lab->bar = pci_iomap(pdev, 0, SZ_1M);
+    if (!lab->bar) {
+        ret = -ENOMEM;
+        goto release_region;
+    }
+    writel(0x12345678, lab->bar + REG_LIVE);
+    if (readl(lab->bar + REG_ID) != 0x010000ed ||
+        readl(lab->bar + REG_LIVE) != (u32)~0x12345678U) {
+        ret = -ENODEV;
+        goto unmap;
+    }
+    writel(0, lab->bar + REG_STATUS);
+    lab->misc.minor = MISC_DYNAMIC_MINOR;
+    lab->misc.name = "edu-lab";
+    lab->misc.fops = &lab_fops;
+    lab->misc.parent = &pdev->dev;
+    lab->misc.mode = 0600;
+    ret = misc_register(&lab->misc);
+    if (ret)
+        goto unmap;
+    pci_set_drvdata(pdev, lab);
+    dev_info(&pdev->dev, "probe OK: BAR0, 28-bit DMA mask, polling\n");
+    return 0;
+unmap:
+    pci_iounmap(pdev, lab->bar);
+release_region:
+    pci_release_region(pdev, 0);
+disable:
+    pci_disable_device(pdev);
+free_lab:
+    kref_put(&lab->ref, lab_release_ref);
+    return ret;
+}
+
+static void lab_remove(struct pci_dev *pdev)
+{
+    struct lab_device *lab = pci_get_drvdata(pdev);
+
+    misc_deregister(&lab->misc);
+    mutex_lock(&lab->op_mutex);
+    lab->state = EDU_LAB_REMOVED;
+    writel(0, lab->bar + REG_STATUS);
+    pci_iounmap(pdev, lab->bar);
+    pci_release_region(pdev, 0);
+    pci_disable_device(pdev);
+    mutex_unlock(&lab->op_mutex);
+    dev_info(&pdev->dev, "remove OK\n");
+    kref_put(&lab->ref, lab_release_ref);
+}
+
+static const struct pci_device_id lab_ids[] = {
+    { PCI_DEVICE(0x1234, 0x11e8) }, { }
+};
+MODULE_DEVICE_TABLE(pci, lab_ids);
+static struct pci_driver lab_driver = {
+    .name = "edu_lab", .id_table = lab_ids,
+    .probe = lab_probe, .remove = lab_remove,
+};
+module_pci_driver(lab_driver);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("QEMU EDU personal driver lab");
