@@ -1,0 +1,3 @@
+7093879c9dad61fb24bb5a0247d8dd1ea444c4854492a9b3669175624cd04bda pool/main/l/linux-signed/linux-image-6.8.0-138-generic_6.8.0-138.138_amd64.deb
+8c4bf559204e8391b96b4301c6bc3b7a1e83e37083674d1176650f5322a07117 pool/main/l/linux/linux-headers-6.8.0-138-generic_6.8.0-138.138_amd64.deb
+14eecea8fe6c8bb8b2796a90592712d6e7c5646f2f5e87b971c5d04e1d2ae631 pool/main/l/linux/linux-headers-6.8.0-138_6.8.0-138.138_all.deb
