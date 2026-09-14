@@ -8,14 +8,26 @@
 #include <linux/kref.h>
 #include <linux/iopoll.h>
 #include <linux/dma-mapping.h>
+#include <linux/interrupt.h>
+#include <linux/completion.h>
+#include <linux/spinlock.h>
 #include "edu_lab.h"
 
 #define REG_ID 0x00
 #define REG_LIVE 0x04
 #define REG_FACT 0x08
 #define REG_STATUS 0x20
+#define REG_IRQ_STATUS 0x24
+#define REG_IRQ_ACK 0x64
 #define STATUS_BUSY 0x01
+#define STATUS_IRQ 0x80
+#define IRQ_FACT 0x01
+#define IRQ_DMA 0x100
 #define LAB_TIMEOUT_MS 1000U
+
+static bool test_drop_irq;
+module_param(test_drop_irq, bool, 0444);
+MODULE_PARM_DESC(test_drop_irq, "TEST ONLY: acknowledge IRQs without completing requests (default off)");
 
 struct lab_device {
     struct pci_dev *pdev;
@@ -23,6 +35,11 @@ struct lab_device {
     struct miscdevice misc;
     struct mutex op_mutex;
     struct kref ref;
+    spinlock_t irq_lock;
+    struct completion done;
+    u32 expected_irq;
+    u64 interrupts;
+    int irq;
     enum edu_lab_state state;
     u64 computations;
     u64 timeouts;
@@ -51,6 +68,58 @@ static int lab_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+/* IRQ context owns only expected_irq, completion, and the IRQ counter.
+ * Operation state and all register programming are serialized by op_mutex. */
+static irqreturn_t lab_irq(int irq, void *opaque)
+{
+    struct lab_device *lab = opaque;
+    u32 pending = readl(lab->bar + REG_IRQ_STATUS);
+    unsigned long flags;
+
+    if (!pending)
+        return IRQ_NONE;
+    writel(pending, lab->bar + REG_IRQ_ACK);
+    readl(lab->bar + REG_IRQ_STATUS); /* Flush the posted acknowledgement. */
+    spin_lock_irqsave(&lab->irq_lock, flags);
+    lab->interrupts++;
+    if ((pending & lab->expected_irq) && !test_drop_irq)
+        complete(&lab->done);
+    spin_unlock_irqrestore(&lab->irq_lock, flags);
+    return IRQ_HANDLED;
+}
+
+static void arm_completion(struct lab_device *lab, u32 expected)
+{
+    unsigned long flags;
+
+    writel(~0U, lab->bar + REG_IRQ_ACK);
+    readl(lab->bar + REG_IRQ_STATUS);
+    spin_lock_irqsave(&lab->irq_lock, flags);
+    reinit_completion(&lab->done);
+    lab->expected_irq = expected;
+    spin_unlock_irqrestore(&lab->irq_lock, flags);
+}
+
+static int wait_completion(struct lab_device *lab)
+{
+    unsigned long flags;
+    bool done = wait_for_completion_timeout(&lab->done,
+                                            msecs_to_jiffies(LAB_TIMEOUT_MS));
+
+    spin_lock_irqsave(&lab->irq_lock, flags);
+    lab->expected_irq = 0;
+    spin_unlock_irqrestore(&lab->irq_lock, flags);
+    if (!done) {
+        lab->state = EDU_LAB_FAILED;
+        lab->timeouts++;
+        writel(0, lab->bar + REG_STATUS);
+        /* No reuse after timeout. Keep resources alive until remove. */
+        dev_info(&lab->pdev->dev, "request timeout; device failed closed\n");
+        return -ETIMEDOUT;
+    }
+    return 0;
+}
+
 static int validate_header(const struct edu_lab_header *h, u32 size)
 {
     if (h->version != EDU_LAB_ABI_VERSION || h->size != size ||
@@ -66,7 +135,7 @@ static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     struct edu_lab_header header;
     struct edu_lab_compute compute;
     struct edu_lab_caps caps;
-    u32 status;
+    unsigned long flags;
     int ret;
 
     if (cmd != EDU_LAB_GET_CAPS && cmd != EDU_LAB_COMPUTE)
@@ -76,8 +145,8 @@ static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     ret = validate_header(&header, _IOC_SIZE(cmd));
     if (ret)
         return ret;
-    if (mutex_lock_interruptible(&lab->op_mutex))
-        return -ERESTARTSYS;
+    if (!mutex_trylock(&lab->op_mutex))
+        return -EBUSY;
     if (lab->state == EDU_LAB_REMOVED) {
         ret = -ENODEV;
         goto out;
@@ -89,7 +158,11 @@ static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         caps.max_factorial = EDU_LAB_MAX_FACTORIAL;
         caps.timeout_ms = LAB_TIMEOUT_MS;
         caps.state = lab->state;
-        caps.features = EDU_LAB_FEATURE_COMPUTE;
+        caps.features = EDU_LAB_FEATURE_COMPUTE | EDU_LAB_FEATURE_IRQ;
+        caps.dma_bits = 28;
+        spin_lock_irqsave(&lab->irq_lock, flags);
+        caps.interrupts = lab->interrupts;
+        spin_unlock_irqrestore(&lab->irq_lock, flags);
         caps.computations = lab->computations;
         caps.timeouts = lab->timeouts;
         ret = copy_to_user(user, &caps, sizeof(caps)) ? -EFAULT : 0;
@@ -110,12 +183,15 @@ static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         goto out;
     }
     lab->state = EDU_LAB_COMPUTE;
+    arm_completion(lab, IRQ_FACT);
+    writel(STATUS_IRQ, lab->bar + REG_STATUS);
     writel(compute.input, lab->bar + REG_FACT);
-    ret = readl_poll_timeout(lab->bar + REG_STATUS, status,
-                            !(status & STATUS_BUSY), 100, LAB_TIMEOUT_MS * 1000);
-    if (ret) {
+    ret = wait_completion(lab);
+    if (ret)
+        goto out;
+    if (readl(lab->bar + REG_STATUS) & STATUS_BUSY) {
         lab->state = EDU_LAB_FAILED;
-        lab->timeouts++;
+        ret = -EIO;
         goto out;
     }
     compute.result = readl(lab->bar + REG_FACT);
@@ -145,6 +221,8 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         return -ENOMEM;
     kref_init(&lab->ref);
     mutex_init(&lab->op_mutex);
+    spin_lock_init(&lab->irq_lock);
+    init_completion(&lab->done);
     lab->pdev = pdev;
     ret = pci_enable_device_mem(pdev);
     if (ret)
@@ -172,6 +250,16 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto unmap;
     }
     writel(0, lab->bar + REG_STATUS);
+    writel(~0U, lab->bar + REG_IRQ_ACK);
+    readl(lab->bar + REG_IRQ_STATUS);
+    pci_set_master(pdev);
+    ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+    if (ret < 0)
+        goto clear_master;
+    lab->irq = pci_irq_vector(pdev, 0);
+    ret = request_irq(lab->irq, lab_irq, 0, "edu_lab", lab);
+    if (ret)
+        goto free_vectors;
     lab->misc.minor = MISC_DYNAMIC_MINOR;
     lab->misc.name = "edu-lab";
     lab->misc.fops = &lab_fops;
@@ -179,10 +267,16 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     lab->misc.mode = 0600;
     ret = misc_register(&lab->misc);
     if (ret)
-        goto unmap;
+        goto free_irq;
     pci_set_drvdata(pdev, lab);
-    dev_info(&pdev->dev, "probe OK: BAR0, 28-bit DMA mask, polling\n");
+    dev_info(&pdev->dev, "probe OK: BAR0, 28-bit DMA mask, MSI\n");
     return 0;
+free_irq:
+    free_irq(lab->irq, lab);
+free_vectors:
+    pci_free_irq_vectors(pdev);
+clear_master:
+    pci_clear_master(pdev);
 unmap:
     pci_iounmap(pdev, lab->bar);
 release_region:
@@ -202,6 +296,11 @@ static void lab_remove(struct pci_dev *pdev)
     mutex_lock(&lab->op_mutex);
     lab->state = EDU_LAB_REMOVED;
     writel(0, lab->bar + REG_STATUS);
+    pci_clear_master(pdev);
+    writel(~0U, lab->bar + REG_IRQ_ACK);
+    readl(lab->bar + REG_IRQ_STATUS);
+    free_irq(lab->irq, lab);
+    pci_free_irq_vectors(pdev);
     pci_iounmap(pdev, lab->bar);
     pci_release_region(pdev, 0);
     pci_disable_device(pdev);

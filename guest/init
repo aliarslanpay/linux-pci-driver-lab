@@ -8,6 +8,9 @@ busybox uname -r
 insmod /edu_lab.ko || poweroff -f
 /edu-client || echo EDU_LAB_FAIL
 rmmod edu_lab || echo EDU_LAB_FAIL
+insmod /edu_lab.ko test_drop_irq=1 || echo EDU_LAB_FAIL
+/edu-client --expect-timeout || echo EDU_LAB_FAIL
+rmmod edu_lab || echo EDU_LAB_FAIL
 dmesg | grep edu_lab
 echo EDU_LAB_SLICE_DONE
 poweroff -f
