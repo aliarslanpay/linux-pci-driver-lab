@@ -21,7 +21,14 @@ initramfs: all
 guest: initramfs
 	CACHE="$(CACHE)" ./scripts/run-guest.sh
 host-check: client
-	./build/edu-client --help
+	./scripts/host-check.sh
 clean:
 	rm -rf build
 	@if test -d "$(KDIR)"; then $(MAKE) -C "$(KDIR)" M=$(CURDIR)/driver clean; fi
+
+build/edu-client-sanitize: client/main.cpp include/edu_lab.h
+	mkdir -p build
+	$(CXX) $(CXXFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Iinclude $< -o $@ -pthread
+.PHONY: sanitize
+sanitize: build/edu-client-sanitize
+	./scripts/host-check.sh ./build/edu-client-sanitize

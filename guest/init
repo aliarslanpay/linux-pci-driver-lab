@@ -3,15 +3,20 @@ export PATH=/bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
-echo 'EDU_LAB_BOOT_OK'
+fail() { echo EDU_LAB_FAIL; dmesg | grep edu_lab; poweroff -f; }
+echo EDU_LAB_BOOT_OK
 busybox uname -r
-insmod /edu_lab.ko || poweroff -f
-/edu-client || echo EDU_LAB_FAIL
-/edu-client --dma || echo EDU_LAB_FAIL
-rmmod edu_lab || echo EDU_LAB_FAIL
-insmod /edu_lab.ko test_drop_irq=1 || echo EDU_LAB_FAIL
-/edu-client --expect-timeout || echo EDU_LAB_FAIL
-rmmod edu_lab || echo EDU_LAB_FAIL
+insmod /edu_lab.ko || fail
+/edu-client self-test || fail
+/edu-client stress 3 4 30 || fail
+/edu-client info || fail
+rmmod edu_lab || fail
+insmod /edu_lab.ko test_drop_irq=1 || fail
+/edu-client expect-timeout compute || fail
+rmmod edu_lab || fail
+insmod /edu_lab.ko test_drop_irq=1 || fail
+/edu-client expect-timeout dma || fail
+rmmod edu_lab || fail
 dmesg | grep edu_lab
 echo EDU_LAB_SLICE_DONE
 poweroff -f
