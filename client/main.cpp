@@ -12,8 +12,24 @@ static_assert(sizeof(edu_lab_compute) == 32);
 static_assert(sizeof(edu_lab_dma) == 4128);
 int main(int argc, char **argv) {
     const bool expect_timeout = argc == 2 && std::strcmp(argv[1], "--expect-timeout") == 0;
+    const bool dma_test = argc == 2 && std::strcmp(argv[1], "--dma") == 0;
     const int fd = open("/dev/edu-lab", O_RDWR | O_CLOEXEC);
     if (fd < 0) { std::cerr << "open: " << std::strerror(errno) << '\n'; return 1; }
+    if (dma_test) {
+        for (unsigned length : {1U, 63U, 1024U, 4096U}) {
+            edu_lab_dma dma{};
+            dma.header = {EDU_LAB_ABI_VERSION, sizeof(dma), 0, 0};
+            dma.length = length;
+            dma.offset = EDU_LAB_DMA_BYTES - length;
+            for (unsigned i = 0; i < length; ++i) dma.data[i] = (i * 37U + 19U) & 255U;
+            if (ioctl(fd, EDU_LAB_DMA_LOOPBACK, &dma) < 0) { close(fd); return 1; }
+            for (unsigned i = 0; i < length; ++i)
+                if (dma.data[i] != ((i * 37U + 19U) & 255U)) { close(fd); return 1; }
+            std::cout << "DMA PASS bytes=" << length << " offset=" << dma.offset << '\n';
+        }
+        close(fd);
+        return 0;
+    }
     edu_lab_compute req{};
     req.header = {EDU_LAB_ABI_VERSION, sizeof(req), 0, 0};
     req.input = 5;

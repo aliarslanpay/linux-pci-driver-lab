@@ -23,6 +23,14 @@
 #define STATUS_IRQ 0x80
 #define IRQ_FACT 0x01
 #define IRQ_DMA 0x100
+#define REG_DMA_SRC 0x80
+#define REG_DMA_DST 0x88
+#define REG_DMA_COUNT 0x90
+#define REG_DMA_CMD 0x98
+#define DMA_RUN 0x01
+#define DMA_FROM_DEVICE 0x02
+#define DMA_IRQ_ENABLE 0x04
+#define EDU_BUFFER_BASE 0x40000ULL
 #define LAB_TIMEOUT_MS 1000U
 
 static bool test_drop_irq;
@@ -43,6 +51,9 @@ struct lab_device {
     enum edu_lab_state state;
     u64 computations;
     u64 timeouts;
+    u64 dma_loopbacks;
+    void *dma_cpu;
+    dma_addr_t dma_addr;
 };
 
 static void lab_release_ref(struct kref *ref)
@@ -128,6 +139,68 @@ static int validate_header(const struct edu_lab_header *h, u32 size)
     return 0;
 }
 
+static int dma_transfer(struct lab_device *lab, u32 offset, u32 length, bool from_device)
+{
+    int ret;
+
+    lab->state = from_device ? EDU_LAB_DMA_FROM : EDU_LAB_DMA_TO;
+    arm_completion(lab, IRQ_DMA);
+    writeq(from_device ? EDU_BUFFER_BASE + offset : lab->dma_addr,
+           lab->bar + REG_DMA_SRC);
+    writeq(from_device ? lab->dma_addr : EDU_BUFFER_BASE + offset,
+           lab->bar + REG_DMA_DST);
+    writeq(length, lab->bar + REG_DMA_COUNT);
+    dma_wmb();
+    writeq(DMA_RUN | DMA_IRQ_ENABLE | (from_device ? DMA_FROM_DEVICE : 0),
+           lab->bar + REG_DMA_CMD);
+    ret = wait_completion(lab);
+    if (!ret && (readq(lab->bar + REG_DMA_CMD) & DMA_RUN)) {
+        lab->state = EDU_LAB_FAILED;
+        ret = -EIO;
+    }
+    if (!ret)
+        dma_rmb();
+    return ret;
+}
+
+static long dma_loopback(struct lab_device *lab, void __user *user)
+{
+    struct edu_lab_dma *req;
+    int ret;
+
+    req = memdup_user(user, sizeof(*req));
+    if (IS_ERR(req))
+        return PTR_ERR(req);
+    ret = validate_header(&req->header, sizeof(*req));
+    /* Subtraction form avoids overflow in offset + length. */
+    if (ret || req->reserved[0] || req->reserved[1] || !req->length ||
+        req->offset >= EDU_LAB_DMA_BYTES ||
+        req->length > EDU_LAB_DMA_BYTES - req->offset) {
+        ret = -EINVAL;
+        goto out;
+    }
+    if (lab->state == EDU_LAB_FAILED) {
+        ret = -EIO;
+        goto out;
+    }
+    memcpy(lab->dma_cpu, req->data, req->length);
+    ret = dma_transfer(lab, req->offset, req->length, false);
+    if (ret)
+        goto out;
+    /* Erase host contents to make a stale-buffer false pass impossible. */
+    memset(lab->dma_cpu, 0, req->length);
+    ret = dma_transfer(lab, req->offset, req->length, true);
+    if (ret)
+        goto out;
+    memcpy(req->data, lab->dma_cpu, req->length);
+    lab->state = EDU_LAB_IDLE;
+    lab->dma_loopbacks++;
+    ret = copy_to_user(user, req, sizeof(*req)) ? -EFAULT : 0;
+out:
+    kfree(req);
+    return ret;
+}
+
 static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct lab_device *lab = file->private_data;
@@ -138,7 +211,8 @@ static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     unsigned long flags;
     int ret;
 
-    if (cmd != EDU_LAB_GET_CAPS && cmd != EDU_LAB_COMPUTE)
+    if (cmd != EDU_LAB_GET_CAPS && cmd != EDU_LAB_COMPUTE &&
+        cmd != EDU_LAB_DMA_LOOPBACK)
         return -ENOTTY;
     if (copy_from_user(&header, user, sizeof(header)))
         return -EFAULT;
@@ -158,7 +232,9 @@ static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         caps.max_factorial = EDU_LAB_MAX_FACTORIAL;
         caps.timeout_ms = LAB_TIMEOUT_MS;
         caps.state = lab->state;
-        caps.features = EDU_LAB_FEATURE_COMPUTE | EDU_LAB_FEATURE_IRQ;
+        caps.features = EDU_LAB_FEATURE_COMPUTE | EDU_LAB_FEATURE_IRQ | EDU_LAB_FEATURE_DMA;
+        caps.dma_bytes = EDU_LAB_DMA_BYTES;
+        caps.dma_loopbacks = lab->dma_loopbacks;
         caps.dma_bits = 28;
         spin_lock_irqsave(&lab->irq_lock, flags);
         caps.interrupts = lab->interrupts;
@@ -166,6 +242,10 @@ static long lab_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         caps.computations = lab->computations;
         caps.timeouts = lab->timeouts;
         ret = copy_to_user(user, &caps, sizeof(caps)) ? -EFAULT : 0;
+        goto out;
+    }
+    if (cmd == EDU_LAB_DMA_LOOPBACK) {
+        ret = dma_loopback(lab, user);
         goto out;
     }
     if (copy_from_user(&compute, user, sizeof(compute))) {
@@ -252,6 +332,16 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     writel(0, lab->bar + REG_STATUS);
     writel(~0U, lab->bar + REG_IRQ_ACK);
     readl(lab->bar + REG_IRQ_STATUS);
+    lab->dma_cpu = dma_alloc_coherent(&pdev->dev, EDU_LAB_DMA_BYTES,
+                                      &lab->dma_addr, GFP_KERNEL);
+    if (!lab->dma_cpu) {
+        ret = -ENOMEM;
+        goto unmap;
+    }
+    if (lab->dma_addr > DMA_BIT_MASK(28) - (EDU_LAB_DMA_BYTES - 1)) {
+        ret = -EIO;
+        goto free_dma;
+    }
     pci_set_master(pdev);
     ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
     if (ret < 0)
@@ -277,6 +367,8 @@ free_vectors:
     pci_free_irq_vectors(pdev);
 clear_master:
     pci_clear_master(pdev);
+free_dma:
+    dma_free_coherent(&pdev->dev, EDU_LAB_DMA_BYTES, lab->dma_cpu, lab->dma_addr);
 unmap:
     pci_iounmap(pdev, lab->bar);
 release_region:
@@ -291,16 +383,28 @@ free_lab:
 static void lab_remove(struct pci_dev *pdev)
 {
     struct lab_device *lab = pci_get_drvdata(pdev);
+    u64 dma_cmd;
+    u32 status;
+    int dma_ret, fact_ret;
 
     misc_deregister(&lab->misc);
     mutex_lock(&lab->op_mutex);
     lab->state = EDU_LAB_REMOVED;
     writel(0, lab->bar + REG_STATUS);
+    /* EDU has no documented abort/reset. Drain, then revoke bus mastering
+     * before releasing the coherent buffer even if the drain times out. */
+    dma_ret = readq_poll_timeout(lab->bar + REG_DMA_CMD, dma_cmd,
+                                !(dma_cmd & DMA_RUN), 1000, LAB_TIMEOUT_MS * 1000);
+    fact_ret = readl_poll_timeout(lab->bar + REG_STATUS, status,
+                                 !(status & STATUS_BUSY), 1000, LAB_TIMEOUT_MS * 1000);
     pci_clear_master(pdev);
+    if (dma_ret || fact_ret)
+        dev_err(&pdev->dev, "remove drain timed out; bus mastering revoked\n");
     writel(~0U, lab->bar + REG_IRQ_ACK);
     readl(lab->bar + REG_IRQ_STATUS);
     free_irq(lab->irq, lab);
     pci_free_irq_vectors(pdev);
+    dma_free_coherent(&pdev->dev, EDU_LAB_DMA_BYTES, lab->dma_cpu, lab->dma_addr);
     pci_iounmap(pdev, lab->bar);
     pci_release_region(pdev, 0);
     pci_disable_device(pdev);
