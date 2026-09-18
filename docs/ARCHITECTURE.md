@@ -21,10 +21,11 @@ address. Factorial input is restricted to 0–12 to avoid EDU's 32-bit overflow.
 
 ## Synchronization and state
 
-`op_mutex` protects operation state, MMIO programming, the coherent buffer, and
-completed-operation/timeout counters. The IRQ handler has a separate spinlock
-for `expected_irq`, its counter, and completion signaling. It acknowledges and
-flushes the actual interrupt status before waking the owner. State transitions:
+`op_mutex` protects operation state, command submission, the coherent buffer,
+and completed-operation/timeout counters. The IRQ handler uses a separate
+spinlock for `expected_irq`, the interrupt counter, and completion signaling.
+IRQ acknowledgement and status flushing happen in interrupt context before
+waking the owner. State transitions:
 
 | Current state | Event | Next state / result |
 | --- | --- | --- |

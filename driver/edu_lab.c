@@ -97,8 +97,9 @@ static int lab_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-/* IRQ context owns only expected_irq, completion, and the IRQ counter.
- * Operation state and all register programming are serialized by op_mutex. */
+/* IRQ context owns expected_irq, completion, the IRQ counter, and IRQ
+ * acknowledgement. Operation state and command submission are serialized
+ * by op_mutex. */
 static irqreturn_t lab_irq(int irq, void *opaque)
 {
     struct lab_device *lab = opaque;
