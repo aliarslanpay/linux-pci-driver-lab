@@ -11,6 +11,7 @@
 #include <linux/interrupt.h>
 #include <linux/completion.h>
 #include <linux/spinlock.h>
+#include <linux/sizes.h>
 #include "edu_lab.h"
 
 #define REG_ID 0x00
@@ -37,6 +38,18 @@ static bool test_drop_irq;
 module_param(test_drop_irq, bool, 0444);
 MODULE_PARM_DESC(test_drop_irq, "TEST ONLY: acknowledge IRQs without completing requests (default off)");
 
+static unsigned int test_fail_probe;
+module_param(test_fail_probe, uint, 0444);
+MODULE_PARM_DESC(test_fail_probe, "TEST ONLY: inject probe failure at acquired-resource stage 1..6 (0 off)");
+
+static bool inject_probe_failure(struct pci_dev *pdev, unsigned int stage)
+{
+    if (test_fail_probe != stage)
+        return false;
+    dev_info(&pdev->dev, "test probe failure stage=%u\n", stage);
+    return true;
+}
+
 struct lab_device {
     struct pci_dev *pdev;
     void __iomem *bar;
@@ -55,6 +68,11 @@ struct lab_device {
     void *dma_cpu;
     dma_addr_t dma_addr;
 };
+
+static_assert(sizeof(struct edu_lab_header) == 16);
+static_assert(sizeof(struct edu_lab_caps) == 80);
+static_assert(sizeof(struct edu_lab_compute) == 32);
+static_assert(sizeof(struct edu_lab_dma) == 4128);
 
 static void lab_release_ref(struct kref *ref)
 {
@@ -296,6 +314,8 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     struct lab_device *lab;
     int ret;
 
+    if (test_fail_probe > 6)
+        return -EINVAL;
     lab = kzalloc(sizeof(*lab), GFP_KERNEL);
     if (!lab)
         return -ENOMEM;
@@ -307,6 +327,10 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     ret = pci_enable_device_mem(pdev);
     if (ret)
         goto free_lab;
+    if (inject_probe_failure(pdev, 1)) {
+        ret = -EIO;
+        goto disable;
+    }
     if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM) ||
         pci_resource_len(pdev, 0) < SZ_1M) {
         ret = -ENODEV;
@@ -315,6 +339,10 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     ret = pci_request_region(pdev, 0, "edu_lab");
     if (ret)
         goto disable;
+    if (inject_probe_failure(pdev, 2)) {
+        ret = -EIO;
+        goto release_region;
+    }
     ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(28));
     if (ret)
         goto release_region;
@@ -322,6 +350,16 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (!lab->bar) {
         ret = -ENOMEM;
         goto release_region;
+    }
+    if (inject_probe_failure(pdev, 3)) {
+        ret = -EIO;
+        goto unmap;
+    }
+    /* Rebinding must not enable bus mastering while an old EDU DMA is active. */
+    if ((readq(lab->bar + REG_DMA_CMD) & DMA_RUN) ||
+        (readl(lab->bar + REG_STATUS) & STATUS_BUSY)) {
+        ret = -EBUSY;
+        goto unmap;
     }
     writel(0x12345678, lab->bar + REG_LIVE);
     if (readl(lab->bar + REG_ID) != 0x010000ed ||
@@ -338,6 +376,10 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         ret = -ENOMEM;
         goto unmap;
     }
+    if (inject_probe_failure(pdev, 4)) {
+        ret = -EIO;
+        goto free_dma;
+    }
     if (lab->dma_addr > DMA_BIT_MASK(28) - (EDU_LAB_DMA_BYTES - 1)) {
         ret = -EIO;
         goto free_dma;
@@ -346,10 +388,18 @@ static int lab_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
     if (ret < 0)
         goto clear_master;
+    if (inject_probe_failure(pdev, 5)) {
+        ret = -EIO;
+        goto free_vectors;
+    }
     lab->irq = pci_irq_vector(pdev, 0);
     ret = request_irq(lab->irq, lab_irq, 0, "edu_lab", lab);
     if (ret)
         goto free_vectors;
+    if (inject_probe_failure(pdev, 6)) {
+        ret = -EIO;
+        goto free_irq;
+    }
     lab->misc.minor = MISC_DYNAMIC_MINOR;
     lab->misc.name = "edu-lab";
     lab->misc.fops = &lab_fops;

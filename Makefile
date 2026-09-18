@@ -32,3 +32,10 @@ build/edu-client-sanitize: client/main.cpp include/edu_lab.h
 .PHONY: sanitize
 sanitize: build/edu-client-sanitize
 	./scripts/host-check.sh ./build/edu-client-sanitize
+
+build/lifecycle-static: tests/lifecycle.cpp include/edu_lab.h
+	mkdir -p build
+	$(CXX) $(CXXFLAGS) -Iinclude $< -o $@ -pthread -static
+.PHONY: integration
+integration: initramfs
+	CACHE="$(CACHE)" ./scripts/integration.sh

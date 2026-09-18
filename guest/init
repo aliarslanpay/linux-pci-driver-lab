@@ -3,20 +3,60 @@ export PATH=/bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
-fail() { echo EDU_LAB_FAIL; dmesg | grep edu_lab; poweroff -f; }
+fail() {
+    echo "EDU_LAB_FAIL: $*"
+    dmesg
+    poweroff -f
+    exit 1
+}
+load() { insmod /edu_lab.ko "$@" || fail 'insmod'; }
+unload() {
+    rmmod edu_lab || fail 'rmmod'
+    test ! -e /dev/edu-lab || fail 'misc node remained'
+    test ! -d /sys/module/edu_lab || fail 'module remained'
+}
 echo EDU_LAB_BOOT_OK
 busybox uname -r
-insmod /edu_lab.ko || fail
-/edu-client self-test || fail
-/edu-client stress 3 4 30 || fail
-/edu-client info || fail
-rmmod edu_lab || fail
-insmod /edu_lab.ko test_drop_irq=1 || fail
-/edu-client expect-timeout compute || fail
-rmmod edu_lab || fail
-insmod /edu_lab.ko test_drop_irq=1 || fail
-/edu-client expect-timeout dma || fail
-rmmod edu_lab || fail
-dmesg | grep edu_lab
-echo EDU_LAB_SLICE_DONE
+/edu-client host-test || fail 'guest host-test'
+load
+/edu-client self-test || fail 'self-test'
+/edu-client stress 4 4 30 || fail 'thread clients'
+# Real concurrent processes have separate address spaces and descriptor tables.
+/edu-client stress 3 1 20 > /tmp/a.log 2>&1 & a=$!
+/edu-client stress 3 1 20 > /tmp/b.log 2>&1 & b=$!
+wait "$a" || fail 'process A'
+wait "$b" || fail 'process B'
+cat /tmp/a.log /tmp/b.log
+/edu-client info || fail 'info'
+/lifecycle 0000:00:02.0 || fail 'lifecycle'
+/edu-client compute 12 || fail 'after rebind'
+unload
+for mode in compute dma; do
+    load test_drop_irq=1
+    /edu-client expect-timeout "$mode" || fail "timeout $mode"
+    unload
+done
+for stage in 1 2 3 4 5 6; do
+    # PCI probe failure does not make module registration fail; inspect binding.
+    load test_fail_probe="$stage"
+    test ! -e /dev/edu-lab || fail "probe hook $stage bound a device"
+    unload
+    load
+    /edu-client compute 5 || fail "recovery after probe failure $stage"
+    unload
+done
+echo 'PROBE_FAILURES PASS stages=6 each-followed-by-successful-reload'
+for iteration in 1 2 3 4 5; do
+    load
+    /edu-client dma 64 4032 || fail "reload $iteration"
+    unload
+done
+echo 'RELOAD PASS cycles=5'
+dmesg > /tmp/kernel.log
+if grep -E 'BUG:|WARNING:|Oops:|Kernel panic|general protection fault|slab-out-of-bounds|use-after-free' /tmp/kernel.log; then
+    fail 'kernel diagnostic'
+fi
+grep -E 'edu_lab|SLUB:' /tmp/kernel.log
+echo 'KERNEL_DIAGNOSTICS PASS no fault/warning signatures; slub_debug=FZP'
+echo EDU_LAB_INTEGRATION_PASS
 poweroff -f
